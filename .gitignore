@@ -1,0 +1,29 @@
+# Dependencies
+**/node_modules/
+
+# Build outputs
+**/.next/
+**/.output/
+**/.nitro/
+**/dist/
+**/*.tsbuildinfo
+
+# Per-app generated dirs
+**/.eve/
+**/.vercel/
+**/.workflow-data/
+
+# Secrets / env files (also blocks .env.example — see exception below)
+**/.env
+**/.env.local
+**/.env.*.local
+
+# Embedded git directories inside subapps
+**/.git/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code per-machine config (memory + local settings)
+.claude/
