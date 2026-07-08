@@ -33,6 +33,21 @@ export function makeTelegramChannel() {
     );
   }
 
+  // Debug: log the bot identity this deployment is using so we can verify
+  // Vercel env matches the expected token. Safe to remove once debugged.
+  void fetch(`https://api.telegram.org/bot${botToken}/getMe`)
+    .then((r) => r.json())
+    .then((me: { ok: boolean; result?: { id: number; username: string } }) => {
+      if (me.ok && me.result) {
+        console.log(
+          `[telegram startup] bot id=${me.result.id} username=@${me.result.username}`,
+        );
+      } else {
+        console.log(`[telegram startup] getMe failed: ${JSON.stringify(me)}`);
+      }
+    })
+    .catch((err) => console.log(`[telegram startup] getMe threw: ${err}`));
+
   return telegramChannel({
     botUsername,
     credentials: {
