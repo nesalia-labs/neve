@@ -33,23 +33,6 @@ export function makeTelegramChannel() {
     );
   }
 
-  // Debug: log the bot identity this deployment is using so we can verify
-  // Vercel env matches the expected token. Safe to remove once debugged.
-  void fetch(`https://api.telegram.org/bot${botToken}/getMe`)
-    .then((r) => r.json())
-    .then((me: { ok: boolean; result?: { id: number; username: string } }) => {
-      if (me.ok && me.result) {
-        console.log(
-          `[telegram startup] bot id=${me.result.id} username=@${me.result.username}`,
-        );
-      } else {
-        console.log(`[telegram startup] getMe failed: ${JSON.stringify(me)}`);
-      }
-    })
-    .catch((err: unknown) =>
-      console.log(`[telegram startup] getMe threw: ${String(err)}`),
-    );
-
   return telegramChannel({
     botUsername,
     credentials: {
@@ -59,44 +42,6 @@ export function makeTelegramChannel() {
     uploadPolicy: {
       allowedMediaTypes: ["image/*", "application/pdf"],
       maxBytes: 10 * 1024 * 1024,
-    },
-    events: {
-      async "message.completed"(
-        event: unknown,
-        channel: { telegram: { post: (msg: string) => Promise<unknown> } },
-      ) {
-        const e = event as {
-          finishReason?: string;
-          message?: string;
-          details?: unknown;
-        };
-        console.log(
-          `[message.completed] finishReason=${e.finishReason} messageLength=${e.message?.length ?? "undefined"}`,
-        );
-        if (e.message) {
-          console.log(
-            `[message.completed] message preview (first 500): ${JSON.stringify(e.message.slice(0, 500))}`,
-          );
-        }
-        if (e.finishReason === "tool-calls" || !e.message) {
-          console.log(
-            `[message.completed] skipped (finishReason=${e.finishReason} hasMessage=${!!e.message})`,
-          );
-          return;
-        }
-        try {
-          await channel.telegram.post(e.message);
-          console.log(
-            `[message.completed] post succeeded (${e.message.length} chars)`,
-          );
-        } catch (err: unknown) {
-          console.error(
-            `[message.completed] post failed:`,
-            err instanceof Error ? err.message : String(err),
-          );
-          throw err;
-        }
-      },
     },
   });
 }
