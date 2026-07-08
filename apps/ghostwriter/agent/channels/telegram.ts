@@ -1,6 +1,6 @@
+import { defineChannel, POST } from "eve/channels";
 import {
   telegramChannel,
-  defaultTelegramAuth,
   getTelegramFile,
   downloadTelegramFile,
 } from "eve/channels/telegram";
@@ -10,19 +10,12 @@ import { groq } from "@ai-sdk/groq";
 /**
  * Telegram channel for ghostwriter, with voice-message transcription.
  *
- * The `onMessage` override detects `voice` / `audio` attachments on the
- * raw Telegram update (eve's `TelegramMessage` parser does not surface
- * these as attachments, so `message.raw` is the only handle), downloads
- * the file via Telegram's `getFile`, transcribes it through Groq's
- * `whisper-large-v3-turbo`, and returns the transcript as a `context`
- * string. eve prepends context strings to the user-role history before
- * the delivery message, so the agent sees the transcript alongside the
- * standard `<telegram_context>` block.
- *
- * For non-voice messages the override mirrors eve's built-in
- * `shouldDispatchTelegramMessage` gate (DM-only, or reply-to-bot /
- * `/ask` command / `@bot_username` mention in groups), so group
- * dispatch rules stay intact.
+ * Wraps eve's built-in `telegramChannel`: intercepts the raw webhook,
+ * downloads and transcribes any `voice` or `audio` attachment via Groq
+ * Whisper, then forwards the request to the inner channel's handler with
+ * the audio replaced by the transcript text. Every other update flows
+ * through unchanged so all of eve's built-in behavior (group dispatch,
+ * HITL, callback queries, reply handling, forum topics) keeps working.
  *
  * Reads credentials from the environment:
  *   TELEGRAM_BOT_TOKEN             — from @BotFather
@@ -64,33 +57,53 @@ if (!groqApiKey) {
 
 const credentials = { botToken, webhookSecretToken };
 
-/**
- * Mirror of eve's `shouldDispatchTelegramMessage` from
- * `eve/dist/src/public/channels/telegram/defaults.js`. Kept inline
- * because `defaultOnMessage` is not part of the public exports.
- */
-function shouldDispatch(
-  message: { from?: { isBot?: boolean }; chat: { type: string }; text: string; caption: string; attachments: readonly unknown[]; replyToMessage?: { from?: { isBot?: boolean } } },
-  rawVoiceOrAudio: unknown,
-  botUsername: string | undefined,
-): boolean {
-  if (message.from?.isBot === true || message.chat.type === "channel") {
-    return false;
-  }
-  const text = message.text || message.caption;
-  const isVoice = rawVoiceOrAudio != null;
-  const hasText = text.trim().length > 0;
-  const hasAttachments = message.attachments.length > 0;
-  if (!isVoice && !hasText && !hasAttachments) {
-    return false;
-  }
-  const isPrivate = message.chat.type === "private";
-  const isReplyToBot = message.replyToMessage?.from?.isBot === true;
-  const isCommand = hasText && /^\/[A-Za-z0-9_]+(?:@[A-Za-z0-9_]+)?(?:\s|$)/.test(text);
-  const isMention =
-    botUsername !== undefined &&
-    text.toLowerCase().includes(`@${botUsername.toLowerCase()}`);
-  return isPrivate || isReplyToBot || isCommand || isMention;
+// Inner channel: handles all of eve's built-in telegram behavior
+// (group dispatch, mentions, HITL, callback queries, forum topics,
+// reply handling). We extract its route handler so we can wrap it.
+const inner = telegramChannel({
+  botUsername,
+  credentials,
+  uploadPolicy: {
+    allowedMediaTypes: [
+      "image/*",
+      "application/pdf",
+      "audio/ogg",
+      "audio/mpeg",
+      "audio/mp4",
+    ],
+    maxBytes: 10 * 1024 * 1024,
+  },
+});
+
+const innerRoute = inner.routes[0];
+if (!innerRoute || innerRoute.transport === "websocket") {
+  throw new Error(
+    "telegramChannel did not expose a single HTTP route; cannot wrap it.",
+  );
+}
+const innerHandler = innerRoute.handler;
+
+type TelegramUpdate = {
+  message?: {
+    voice?: { file_id: string };
+    audio?: { file_id: string };
+    caption?: string;
+    from?: { id?: number | string };
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+};
+
+function formatTranscriptHeader(
+  durationInSeconds: number | undefined,
+  language: string | undefined,
+  text: string,
+  originalCaption: string | undefined,
+): string {
+  const dur = durationInSeconds ?? "?";
+  const lang = language ?? "?";
+  const header = `[voice ${dur}s, lang=${lang}]\n${text}`;
+  return originalCaption ? `${header}\n${originalCaption}` : header;
 }
 
 async function transcribeVoiceNote(fileId: string): Promise<{
@@ -99,7 +112,10 @@ async function transcribeVoiceNote(fileId: string): Promise<{
   durationInSeconds: number | undefined;
 }> {
   const { filePath } = await getTelegramFile({ credentials, fileId });
-  const fileResponse = await downloadTelegramFile({ credentials, filePath });
+  const fileResponse = await downloadTelegramFile({
+    credentials,
+    filePath,
+  });
   if (!fileResponse.ok) {
     throw new Error(
       `Telegram file download failed: ${fileResponse.status} ${fileResponse.statusText}`,
@@ -120,81 +136,101 @@ async function transcribeVoiceNote(fileId: string): Promise<{
   };
 }
 
-function formatTranscript(
-  durationInSeconds: number | undefined,
-  language: string | undefined,
-  text: string,
-  originalCaption: string,
-): string {
-  const header = `[voice ${durationInSeconds ?? "?"}s, lang=${language ?? "?"}]\n${text}`;
-  return originalCaption ? `${header}\n${originalCaption}` : header;
+function buildModifiedRequest(
+  original: Request,
+  modifiedBody: string,
+): Request {
+  return new Request(original.url, {
+    method: original.method,
+    headers: original.headers,
+    body: modifiedBody,
+  });
 }
 
-export default telegramChannel({
-  botUsername,
-  credentials,
-  uploadPolicy: {
-    allowedMediaTypes: [
-      "image/*",
-      "application/pdf",
-      "audio/ogg",
-      "audio/mpeg",
-      "audio/mp4",
-    ],
-    maxBytes: 10 * 1024 * 1024,
-  },
-  onMessage: async (ctx, message) => {
-    const rawMessage = (message.raw as { message?: { voice?: { file_id: string }; audio?: { file_id: string } } })
-      ?.message;
-    const voiceOrAudio = rawMessage?.voice ?? rawMessage?.audio;
+// The inner telegramChannel's route handler is parameterized over
+// TelegramChannelState, while our wrapping defineChannel has no state of
+// its own. At runtime the framework hands the same `args` (session
+// machinery, send, getSession, etc.) to both handlers — only the generic
+// type parameter differs. Cast once here so the rest of the file stays
+// type-safe.
+type InnerArgs = Parameters<typeof innerHandler>[1];
+function forwardToInner(req: Request, args: unknown, body: string) {
+  return innerHandler(
+    buildModifiedRequest(req, body),
+    args as InnerArgs,
+  );
+}
 
-    if (
-      !shouldDispatch(
-        message,
-        voiceOrAudio,
-        ctx.telegram.botUsername,
-      )
-    ) {
-      return null;
-    }
+export default defineChannel({
+  routes: [
+    POST("/eve/v1/telegram", async (req, args) => {
+      const originalBody = await req.text();
 
-    await ctx.telegram.startTyping();
+      let parsed: TelegramUpdate;
+      try {
+        parsed = JSON.parse(originalBody);
+      } catch {
+        // Not JSON — let the inner channel decide (it will 200 "ok" on bad JSON)
+        return forwardToInner(req, args, originalBody);
+      }
 
-    if (!voiceOrAudio) {
-      return { auth: defaultTelegramAuth(message) };
-    }
+      const voiceOrAudio = parsed?.message?.voice ?? parsed?.message?.audio;
 
-    const userId = message.from?.id;
-    try {
-      const { text, language, durationInSeconds } =
-        await transcribeVoiceNote(voiceOrAudio.file_id);
+      if (!voiceOrAudio) {
+        // Plain pass-through — preserves every built-in behavior
+        return forwardToInner(req, args, originalBody);
+      }
 
-      console.log(
-        `[voice transcription] user=${userId ?? "?"} duration=${durationInSeconds ?? "?"} lang=${language ?? "?"} chars=${text.length}`,
-      );
+      const userId = parsed?.message?.from?.id;
+      const originalCaption = parsed?.message?.caption;
 
-      const transcript = formatTranscript(
-        durationInSeconds,
-        language,
-        text,
-        message.caption,
-      );
+      try {
+        const { text, language, durationInSeconds } =
+          await transcribeVoiceNote(voiceOrAudio.file_id);
 
-      return {
-        auth: defaultTelegramAuth(message),
-        context: [transcript],
-      };
-    } catch (error) {
-      console.error(
-        `[voice transcription] failed user=${userId ?? "?"}`,
-        error,
-      );
-      return {
-        auth: defaultTelegramAuth(message),
-        context: [
-          "I couldn't transcribe that voice note, please retry or send as text.",
-        ],
-      };
-    }
-  },
+        console.log(
+          `[voice transcription] user=${userId ?? "?"} duration=${durationInSeconds ?? "?"} lang=${language ?? "?"} chars=${text.length}`,
+        );
+
+        const transcript = formatTranscriptHeader(
+          durationInSeconds,
+          language,
+          text,
+          originalCaption,
+        );
+
+        const modifiedMessage = {
+          ...parsed.message,
+          voice: undefined,
+          audio: undefined,
+          text: transcript,
+          caption: "",
+        };
+        const modifiedBody = JSON.stringify({
+          ...parsed,
+          message: modifiedMessage,
+        });
+
+        return forwardToInner(req, args, modifiedBody);
+      } catch (error) {
+        console.error(
+          `[voice transcription] failed user=${userId ?? "?"}`,
+          error,
+        );
+        const fallbackText =
+          "I couldn't transcribe that voice note, please retry or send as text.";
+        const fallbackBody = JSON.stringify({
+          ...parsed,
+          message: {
+            ...parsed.message,
+            voice: undefined,
+            audio: undefined,
+            text: fallbackText,
+            caption: "",
+          },
+        });
+        return forwardToInner(req, args, fallbackBody);
+      }
+    }),
+  ],
 });
