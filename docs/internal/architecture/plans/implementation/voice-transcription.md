@@ -1,40 +1,24 @@
 # Implementation Plan: Telegram Voice Message Transcription
 
-**Status**: Implemented (uncommitted, in working tree)
+**Status**: Ready to implement
 **Owner**: Ghostwriter
-**Last updated**: 2026-07-08
+**Last updated**: 2026-07-07
 **Related spec**: `docs/internal/product/agent/features/transcription/README.md`
 
 This plan covers the concrete code, dependency, and configuration changes
 required to ship the feature described in the spec. It assumes the spec
 has been agreed on and stays inside the decisions made there.
 
-## What was actually implemented
-
-The original plan proposed using `telegramChannel`'s `onMessage` hook to
-intercept voice updates. After reading `eve@0.20.0`'s
-`apps/ghostwriter/node_modules/eve/dist/src/public/channels/telegram/telegramChannel.d.ts`,
-that approach was rejected: `onMessage` only returns `null | { auth, context }`
-and cannot replace the message body with our transcript.
-
-The actual implementation is a **wrapper channel** that uses `defineChannel`
-to mount `POST /eve/v1/telegram` itself, intercepts the raw webhook,
-transcribes voice/audio updates, and forwards a modified `Request` to
-the inner `telegramChannel`'s route handler. The inner handler does the
-real dispatch (group gating, mentions, HITL, callback queries, forum
-topics, reply handling) — we just rewrite the message body before
-handing off.
-
 ## Scope
 
 In scope:
 
-- New npm dependency: `@ai-sdk/groq@^4`.
+- New npm dependency: `@ai-sdk/groq`.
 - New environment variable: `GROQ_API_KEY`.
-- One file rewritten: `apps/ghostwriter/agent/channels/telegram.ts`.
+- Two files modified: `apps/ghostwriter/agent/channels/telegram.ts`,
+  `apps/ghostwriter/.env` (local) and the Vercel project env (production).
 - One file extended: `apps/ghostwriter/agent/instructions.md` (one
   paragraph added).
-- `.env` (local) and Vercel project env (production) — add `GROQ_API_KEY`.
 
 Out of scope:
 
@@ -48,23 +32,24 @@ Out of scope:
 
 ### Install the Groq provider package
 
-Verified compatible: `@ai-sdk/groq@4.x` aligns with `ai@7.x`
-(`@ai-sdk/groq@4.0.5` ships `TranscriptionModelV4`, the type
-`transcribe()` from `ai@7` expects).
+The project pins `ai@^7.0.0` via direct dependency plus an `overrides`
+block. Add `@ai-sdk/groq` as a direct dependency at a version compatible
+with `ai@7.x`. Check `node_modules/@ai-sdk/groq/package.json` for the
+declared peer range before pinning; align with whatever the current `ai`
+major supports.
 
 ```
-cd apps/ghostwriter
-npm install @ai-sdk/groq@^4
+npm install @ai-sdk/groq
 ```
 
 Verify after install:
 
 - `apps/ghostwriter/package.json` lists `@ai-sdk/groq` under
-  `dependencies` with a `^4` range.
-- `node_modules/@ai-sdk/groq/dist/index.d.ts` exposes a
-  `transcription(modelId: GroqTranscriptionModelId)` method returning
-  `TranscriptionModelV4`.
-- `package-lock.json` updated.
+  `dependencies`.
+- `node_modules/@ai-sdk/groq` exists.
+- `node_modules/@ai-sdk/groq/package.json` declares
+  `@ai-sdk/provider` as a peer at a version already satisfied by the
+  transitive tree.
 
 ### Add the API key
 
@@ -93,20 +78,23 @@ export.
 
 ### `apps/ghostwriter/agent/channels/telegram.ts`
 
-Rewritten end to end. The new file is a `defineChannel` wrapper around
-eve's `telegramChannel`. Imports come from `eve/channels` (for
-`defineChannel` and `POST`), `eve/channels/telegram` (for the inner
-`telegramChannel` plus the `getTelegramFile` and `downloadTelegramFile`
-helpers), `ai` (for `transcribe`), and `@ai-sdk/groq` (for `groq`).
+This is the only code-bearing file. The change has three parts: tighten
+env validation to include `GROQ_API_KEY`, expand `uploadPolicy` to allow
+the audio MIME types, and add an `onMessage` override that intercepts
+voice and audio updates.
 
 #### 1. Env validation block
 
-Top-of-file fail-fast checks for `TELEGRAM_BOT_TOKEN`,
-`TELEGRAM_WEBHOOK_SECRET_TOKEN`, `TELEGRAM_BOT_USERNAME`, and the new
-`GROQ_API_KEY`. Each check throws with an actionable message (e.g. for
-`GROQ_API_KEY`: "Get a key from https://console.groq.com/keys"). The
-existing `crypto.randomBytes(32).toString('hex')` generator hint for
-the webhook secret is preserved.
+Add `GROQ_API_KEY` to the existing fail-fast block. Reuse the same
+shape as the existing checks so the error messages stay consistent.
+
+Add a `getEnv` helper or inline check that throws at module load time
+with a message of the form:
+
+> `GROQ_API_KEY is not set. Add it to .env. Get a key from https://console.groq.com/keys`
+
+This matches the tone of the existing `TELEGRAM_BOT_TOKEN` /
+`TELEGRAM_WEBHOOK_SECRET_TOKEN` checks above it.
 
 #### 2. `uploadPolicy.allowedMediaTypes`
 
@@ -114,62 +102,58 @@ Add three entries to the existing `["image/*", "application/pdf"]` array:
 
 | Entry | Why |
 |---|---|
-| `audio/ogg` | Telegram voice notes are typically Ogg Opus. Verified via the `Voice.mime_type` field documented in `python-telegram-bot@v22.7/src/telegram/_files/voice.py`. |
+| `audio/ogg` | Telegram voice notes are typically Ogg Opus. Verified via `Voice.mime_type` field documented in `python-telegram-bot@v22.7/src/telegram/_files/voice.py`. |
 | `audio/mpeg` | Generic MP3 audio sent as `message.audio`. |
 | `audio/mp4` | M4A audio sent as `message.audio`. |
 
 The `maxBytes: 10 * 1024 * 1024` cap stays. Telegram `getFile` itself caps
-downloads at 20 MB (verified via the python-telegram-bot `File` class
-note); our 10 MB cap is conservative on purpose and covers roughly an
-hour of voice at typical Opus bitrates.
+downloads at 20 MB; our 10 MB cap is conservative on purpose and covers
+roughly an hour of voice at typical Opus bitrates.
 
-#### 3. The wrapper route handler
+#### 3. `onMessage` override
 
-The new file's default export is a `defineChannel({ routes: [...] })`
-with a single `POST("/eve/v1/telegram", ...)` route. The handler:
+The eve `telegramChannel` accepts an `onMessage(update, ctx)` hook. We
+register one that:
 
-1. Reads the original body once via `req.text()`.
-2. JSON-parses it into a loose `TelegramUpdate` shape.
-3. Detects `parsed.message.voice ?? parsed.message.audio`.
-4. **If neither** → forwards the original body unchanged to the inner
-   handler. Every other update type passes through transparently.
-5. **If voice/audio** → calls `getTelegramFile({ credentials, fileId })`
-   to resolve a `file_path`, then `downloadTelegramFile({ credentials,
-   filePath })` to fetch the bytes, then `transcribe({ model:
-   groq.transcription("whisper-large-v3-turbo"), audio: Buffer, abortSignal:
-   AbortSignal.timeout(15_000) })`. On success, builds a modified JSON
-   body that replaces `voice`/`audio` with `text: "[voice Ns,
-   lang=xx]\n<transcript>"` (and appends any original caption on a third
-   line) and forwards it to the inner handler.
-6. **On error** → logs the failure at error level and forwards a
-   fallback text message ("I couldn't transcribe that voice note, please
-   retry or send as text.") so the agent at least replies rather than
-   hanging.
+1. Detects `update.message.voice ?? update.message.audio`.
+2. If neither is present, returns `ctx.default(update)` so the existing
+   dispatch path runs unchanged.
+3. If one is present, downloads the file via `getFile`, transcribes via
+   Groq's `whisper-large-v3-turbo`, formats the transcript with the
+   `[voice Ns, lang=xx]` header, and calls `ctx.send(...)` with the
+   resulting text plus the original `auth` and `continuationToken`.
 
-#### 4. Type cast for the inner handler
+The exact shape of the override is in the spec. The implementation
+should:
 
-The inner `telegramChannel`'s route handler is parameterized over
-`TelegramChannelState`, while our wrapping `defineChannel` has no state of
-its own. The framework hands the same `args` (session machinery, `send`,
-`getSession`, etc.) to both handlers at runtime — only the generic type
-parameter differs. A single cast via `Parameters<typeof innerHandler>[1]`
-keeps the rest of the file type-safe.
-
-#### 5. Logging
-
-One `console.log` per successful transcription at the agreed shape
-(`user`, `duration`, `lang`, `chars`). Errors logged via `console.error`.
-No transcript content in logs.
+- Use the AI SDK's `transcribe()` from `ai`, not a direct HTTP call to
+  Groq. The function takes care of multipart upload, base64 encoding,
+  and response parsing.
+- Pass `Buffer` from `arrayBuffer()` to `transcribe({ audio })`. The
+  `Buffer` form is documented in the AI SDK transcription reference.
+- Set a hard timeout (suggested: `AbortSignal.timeout(15_000)`) on the
+  `transcribe()` call so a stuck Groq request cannot pin the function
+  invocation.
+- Log one line per successful transcription at `info` level with the
+  shape agreed in the spec (user_id, duration, language, transcript
+  length). Do not log the transcript content itself.
+- On `transcribe()` throwing, log the error and surface a short
+  user-facing message via `ctx.send` ("I couldn't transcribe that
+  voice note, please retry or send as text") rather than letting the
+  error bubble.
 
 ### `apps/ghostwriter/agent/instructions.md`
 
-Renumbered "How you work" list to insert a new step 3 about voice
-messages. The new step says voice notes are pre-transcribed server-side,
-explains the `[voice Ns, lang=xx]` header format, and tells the agent to
-treat the transcript as ordinary user input. Mentions that captions on
-voice notes appear on a third line after the transcript.
+Add one short paragraph under the "How you work" section, between
+"Research first." and "Draft with structure.":
 
-The rest of `instructions.md` is untouched. No changes to
+> **Voice messages.** Telegram voice notes are transcribed server-side
+> via Groq Whisper before reaching you. The user message you see is
+> formatted as `[voice Ns, lang=xx]` on one line, followed by the
+> transcript. Treat the transcript as ordinary user input. You do not
+> need to acknowledge the voice provenance unless the user asks.
+
+The rest of `instructions.md` stays untouched. No changes to
 `agent/agent.ts`, no changes to `agent/connections/*`, no changes to the
 tool belt.
 
@@ -178,16 +162,14 @@ tool belt.
 Run these in order. Each must pass before moving to the next.
 
 1. **Type check**: `cd apps/ghostwriter && npm run typecheck`.
-   Expect zero errors. **Verified 2026-07-08 against Node 22 in this
-   shell — passed. The full `eve build` requires Node 24 (per
-   `.node-version`); run that on the dev box before merging.**
+   Expect zero errors. The new `transcribe()` import and `onMessage`
+   handler must typecheck against the installed `ai@^7` and `eve@^0.20`.
 
 2. **Build**: `cd apps/ghostwriter && npm run build`. Expect a clean
-   build with no missing-module errors. (Requires Node 24.)
+   build with no missing-module errors.
 
 3. **Dev server**: `cd apps/ghostwriter && npm run dev`. Expect the
-   channel to mount without throwing on the new env check. If any env var
-   is missing, startup fails with a specific message.
+   channel to mount without throwing on the new env check.
 
 4. **Webhook health**: `curl -i https://ghostwriter-agent.nesalia.com/eve/v1/telegram`.
    Expect a 401 or 405 (Telegram never sends GET). This proves the route
@@ -205,18 +187,22 @@ Run these in order. Each must pass before moving to the next.
 
 7. **Group dispatch sanity**: in a Telegram group with the bot added,
    send a voice note without mentioning the bot. Expect no reaction
-   (the wrapper passes through, eve's group dispatch rules apply). Then
+   (the override's early return + eve's group dispatch rules). Then
    send a voice note with `@bot_username` mentioned; expect a reply.
 
 ## Deploy
 
-1. Merge the branch to `main`. Vercel will redeploy automatically.
-2. Confirm the deployment's environment includes `GROQ_API_KEY`
-   (Vercel dashboard → Deployments → latest → Environment). If the env
-   var is missing at runtime, the channel's startup validation will
-   throw.
+1. Merge the branch to `main`. The repo's GitHub Action (or whatever CI
+   runs on push to `main`) will pick up the change.
+
+2. Vercel will redeploy automatically. Confirm the deployment's
+   environment includes `GROQ_API_KEY` (Vercel dashboard →
+   Deployments → latest → Environment). If the env var is missing at
+   runtime, the channel's startup validation will throw.
+
 3. Re-run `curl -i https://ghostwriter-agent.nesalia.com/eve/v1/telegram`
    against the production URL to confirm the route still responds.
+
 4. From a phone, send a production voice note. Confirm reply latency
    and transcript quality match the local test.
 
@@ -225,63 +211,56 @@ Run these in order. Each must pass before moving to the next.
 The change is small enough to revert with `git revert <merge-sha>`
 followed by a push. The webhook does not need to be re-registered;
 `setWebhook` was called once at bot setup and points at the channel's
-`POST /eve/v1/telegram` route which exists regardless of the wrapper.
-
+`POST /eve/v1/telegram` route which exists regardless of the override.
 After revert:
 
-- Voice updates fall back to the pre-wrapper behavior. With the new
-  audio MIME types still in `uploadPolicy`, the inner telegramChannel
-  will try to fetch the file (the inner handler calls
-  `collectTelegramFileParts` on `message.attachments`, which only
-  surfaces `document | photo` kinds — voice has no kind in eve's
-  attachment model). The user message will be empty text and no file
-  parts, so the agent will receive the `<telegram_context>` block with
-  nothing from the user. That's a degraded but non-crashing state.
+- Voice updates fall back to the default channel dispatch. With the new
+  audio MIME types still in `uploadPolicy`, the file will be fetched
+  and passed as a `FilePart` to the agent. The agent may then ignore
+  the audio silently (M3 may not consume audio natively) or surface
+  an error to the user. Either is acceptable as a degraded state.
 - Text, photo, PDF, and group-dispatch behavior is unchanged.
 - The `GROQ_API_KEY` env var becomes unused but harmless. Remove it
-  from Vercel in the same revert PR if you want to keep the env clean.
+  from Vercel in the same revert PR if you want to keep the env
+  clean.
 
-A targeted rollback that keeps the dependency installed but reverts only
-the wrapper logic is also acceptable. The smaller-blast-radius option
-is to restore the original `telegramChannel({ ... })` direct export
-without our wrapper, redeploy, and accept the degraded voice state.
+A targeted rollback that keeps the dependency installed but disables
+only the `onMessage` override is also acceptable: comment out the
+override export, redeploy. This is the smaller-blast-radius option if
+the rollback is due to a transcription-specific bug rather than a
+fundamental design issue.
 
-## Open questions (resolved by implementation)
+## Open questions before merge
 
-These were open in the spec at planning time; the implementation
-resolved them as follows:
+These are the items the spec left ambiguous and that the implementation
+will pin down. Worth a quick decision before code lands:
 
-1. **Error message wording**: confirmed exactly as the spec suggested:
-   "I couldn't transcribe that voice note, please retry or send as text."
+1. **What does the error message look like exactly?** Suggested in the
+   spec as "I couldn't transcribe that voice note, please retry or send
+   as text". Confirm or rewrite.
 
-2. **`getFile` location**: lives inline in `channels/telegram.ts`. The
-   calls go through eve's own `getTelegramFile` and `downloadTelegramFile`
-   helpers (not raw HTTP), so the channel file stays declarative. A
-   separate helper module was not needed at this scale.
+2. **Where does the `getFile` download happen?** We call Telegram's
+   `getFile` HTTP endpoint directly using `process.env.TELEGRAM_BOT_TOKEN`
+   in the channel file. Confirm this is acceptable, or whether it
+   should live in a separate helper module.
 
-3. **`sendVoice` magic trigger**: confirmed out of scope for this
-   iteration. The agent receives a text transcript and replies in text.
+3. **Does the agent's reply pass through `sendVoice` if the transcript
+   starts with a magic trigger word (e.g. "voice reply:")?** The spec
+   says no for this iteration. Confirm.
 
-4. **Log destination**: confirmed Vercel stdout via `console.log` /
-   `console.error`. No structured logger added.
+4. **Where do the one-line info logs go — Vercel stdout, or a structured
+   logger?** The spec assumes stdout. Confirm or pick a logger.
 
-## What changed from the 2026-07-07 draft
+## Estimated effort
 
-- **Approach**: `onMessage` override → `defineChannel` wrapper.
-- **File count**: same (one rewritten channel file, one extended
-  instructions file).
-- **Dependency**: `@ai-sdk/groq` confirmed compatible at `^4`.
-- **Verification**: typecheck verified passing on 2026-07-08 (build
-  deferred to dev box due to Node version mismatch in the work shell).
+Roughly:
 
-## Estimated effort (actual)
+- Dependency install and env wiring: 5 minutes
+- `channels/telegram.ts` rewrite: 30–45 minutes (including env
+  validation, `onMessage` override, error path)
+- `instructions.md` paragraph: 5 minutes
+- Local verification (steps 1–7 above): 30 minutes
+- Deploy and production smoke test: 15 minutes
 
-- Verification prep (`onMessage` signature deep-dive, API exploration): 30 min
-- Dependency install and env wiring: 2 min
-- `channels/telegram.ts` rewrite (incl. type-cast debugging): 30 min
-- `instructions.md` paragraph: 2 min
-- Typecheck pass: 2 min
-- Plan doc revision: 10 min
-
-Total: roughly 75 minutes of focused work, plus the time spent on
-verification prep before coding.
+Total: under two hours of focused work for someone familiar with the
+existing channel file.
